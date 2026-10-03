@@ -356,30 +356,95 @@ local DEFAULT_CHAPTER = { steps = {
 -- ============================================================
 -- MAP DETECTION
 -- ============================================================
-local function detectChapter()
-    -- Prefer an explicit map attribute or tag when available.
-    local mapName = workspace:GetAttribute("PiggyChapter")
-    if typeof(mapName) == "string" and CHAPTERS[mapName] then
-        return mapName, CHAPTERS[mapName]
-    end
+local function normaliseMapName(name)
+    return tostring(name):lower():gsub("[^%w]", "")
+end
 
+local function exactChapterName(name)
+    local wanted = normaliseMapName(name)
     for chapterName in pairs(CHAPTERS) do
-        if CollectionService:HasTag(workspace, "Chapter_" .. chapterName) then
+        if normaliseMapName(chapterName) == wanted then
             return chapterName, CHAPTERS[chapterName]
         end
     end
+    return nil
+end
 
-    -- Fallback for maps whose model name contains the chapter name.
-    for _, v in ipairs(workspace:GetDescendants()) do
-        local lowerName = v.Name:lower()
+local function detectChapter()
+    -- Best option: set workspace:SetAttribute("PiggyChapter", "Plant")
+    -- from the map loader, or tag the active map model "Chapter_Plant".
+    -- This is intentionally checked before item-name scanning.
+    local attributeName = workspace:GetAttribute("PiggyChapter")
+    if typeof(attributeName) == "string" then
+        local chapterName, chapter = exactChapterName(attributeName)
+        if chapterName then return chapterName, chapter end
+    end
+
+    local containers = {}
+    for _, containerName in ipairs({"Map", "CurrentMap", "ActiveMap", "MapFolder"}) do
+        local container = workspace:FindFirstChild(containerName)
+        if container then
+            table.insert(containers, container)
+        end
+    end
+
+    -- Only inspect the active map container first. This prevents a random
+    -- descendant named Station from winning while playing Plant.
+    for _, container in ipairs(containers) do
+            local taggedName
+            for chapterName in pairs(CHAPTERS) do
+                if CollectionService:HasTag(container, "Chapter_" .. chapterName) then
+                    return chapterName, CHAPTERS[chapterName]
+                end
+            end
+            local exactName, exactChapter = exactChapterName(container.Name)
+            if exactName then return exactName, exactChapter end
+            for _, child in ipairs(container:GetChildren()) do
+                local childName, childChapter = exactChapterName(child.Name)
+                if childName then return childName, childChapter end
+                if CollectionService:HasTag(child, "ActiveMap") then
+                    for chapterName in pairs(CHAPTERS) do
+                        if normaliseMapName(child.Name):find(normaliseMapName(chapterName), 1, true) then
+                            return chapterName, CHAPTERS[chapterName]
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- Then inspect only direct Workspace children for an exact map name.
+    for _, child in ipairs(workspace:GetChildren()) do
+        local childName, childChapter = exactChapterName(child.Name)
+        if childName then return childName, childChapter end
         for chapterName in pairs(CHAPTERS) do
-            if lowerName:find(chapterName:lower(), 1, true) then
+            if CollectionService:HasTag(child, "Chapter_" .. chapterName) then
                 return chapterName, CHAPTERS[chapterName]
             end
         end
     end
 
-    return "Unknown", DEFAULT_CHAPTER
+    -- Last-resort compatibility fallback: choose the chapter with the most
+    -- matching named targets, rather than returning the first pairs() result.
+    local bestName, bestChapter, bestScore = "Unknown", DEFAULT_CHAPTER, 0
+    for chapterName, chapter in pairs(CHAPTERS) do
+        local score = 0
+        for _, step in ipairs(chapter.steps) do
+            for _, pattern in ipairs(step.n) do
+                for _, instance in ipairs(workspace:GetDescendants()) do
+                    if (instance:IsA("BasePart") or instance:IsA("Model"))
+                        and instance.Name:lower():find(pattern:lower(), 1, true) then
+                        score += 1
+                        break
+                    end
+                end
+            end
+        end
+        if score > bestScore then
+            bestName, bestChapter, bestScore = chapterName, chapter, score
+        end
+    end
+    return bestName, bestChapter
 end
 
 local CHAPTER_NAME, CHAPTER = detectChapter()
@@ -429,7 +494,7 @@ end
 -- INTERACTION (prompt + clickdetector + touch)
 -- ============================================================
 local function interact(part)
-    if not part then return end
+    if not part or not part.Parent then return false end
     local acted = false
     local prompt = part:FindFirstChildOfClass("ProximityPrompt")
     if not prompt then
@@ -437,17 +502,29 @@ local function interact(part)
             if d:IsA("ProximityPrompt") then prompt = d; break end
         end
     end
-    if prompt and fpp then pcall(function() fpp(prompt) end); acted = true end
+    if prompt and fpp then
+        local ok = pcall(function() fpp(prompt) end)
+        acted = ok or acted
+    end
     local cd = part:FindFirstChildOfClass("ClickDetector")
     if not cd then
         for _, d in ipairs(part:GetDescendants()) do
             if d:IsA("ClickDetector") then cd = d; break end
         end
     end
-    if cd and fcd then pcall(function() fcd(cd) end); acted = true end
-    if not acted and fti then
-        pcall(function() fti(hrp, part, 0); task.wait(0.08); fti(hrp, part, 1) end)
+    if cd and fcd then
+        local ok = pcall(function() fcd(cd) end)
+        acted = ok or acted
     end
+    if not acted and fti and part:IsA("BasePart") then
+        local ok = pcall(function()
+            fti(hrp, part, 0)
+            task.wait(0.08)
+            fti(hrp, part, 1)
+        end)
+        acted = ok or acted
+    end
+    return acted
 end
 
 -- ============================================================
@@ -473,8 +550,8 @@ local function findTaggedOrNamed(patterns)
 
     -- Tags are preferred. A chapter target can have tags such as Use_ExitDoor.
     for _, pattern in ipairs(patterns) do
-        local tag = pattern
-        if CollectionService:GetTagged(tag)[1] then
+        local possibleTags = {pattern, "Spawn_" .. pattern, "Use_" .. pattern}
+        for _, tag in ipairs(possibleTags) do
             for _, instance in ipairs(CollectionService:GetTagged(tag)) do
                 if instance:IsDescendantOf(workspace) and not seen[instance] then
                     seen[instance] = true
@@ -506,39 +583,93 @@ end
 -- ============================================================
 local running = false
 local currentStep = 1
+local handledTargets = {}
+local activeHighlights = {}
+
+local function clearHighlights()
+    for target, highlight in pairs(activeHighlights) do
+        if highlight then highlight:Destroy() end
+        activeHighlights[target] = nil
+    end
+end
+
+local function highlightTarget(target, color)
+    if activeHighlights[target] or not target or not target.Parent then return end
+    local h = Instance.new("Highlight")
+    h.Name = "KestrelObjectiveHighlight"
+    h.Adornee = target
+    h.FillColor = color
+    h.OutlineColor = Color3.fromRGB(255, 255, 255)
+    h.FillTransparency = 0.45
+    h.OutlineTransparency = 0
+    h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    h.Parent = target
+    activeHighlights[target] = h
+end
 
 local function loop()
     currentStep = 1
+    handledTargets = {}
     while running do
         task.wait(0.4)
         if not hrp or not hrp.Parent then return end
         local bot, bd = nearestBot()
         if bd and bd < CONF.BotRetreat then
-            local away = hrp.Position + (hrp.Position - bot.HumanoidRootPart.Position).Unit * 50
-            walker:WalkTo(away)
+            clearHighlights()
+            local awayDirection = hrp.Position - bot.HumanoidRootPart.Position
+            if awayDirection.Magnitude > 0.1 then
+                walker:WalkTo(hrp.Position + awayDirection.Unit * 50)
+            end
         else
-            if currentStep > #CHAPTER.steps then currentStep = 1 end
+            if currentStep > #CHAPTER.steps then
+                clearHighlights()
+                running = false
+                break
+            end
+
             local step = CHAPTER.steps[currentStep]
             local found = findTaggedOrNamed(step.n)
-            if #found > 0 then
+            local remaining = 0
+            clearHighlights()
+
+            local color = step.t == "pickup"
+                and Color3.fromRGB(0, 255, 120)
+                or Color3.fromRGB(255, 170, 0)
+
+            for _, target in ipairs(found) do
+                if not handledTargets[target] and target.Parent then
+                    remaining += 1
+                    highlightTarget(target, color)
+                end
+            end
+
+            if remaining == 0 then
+                currentStep += 1
+                handledTargets = {}
+            else
                 for _, target in ipairs(found) do
-                    local walkTarget = getWalkTarget(target)
-                    if walkTarget then
-                        local ok, reason = walker:WalkTo(walkTarget)
-                        if ok then
-                            interact(target)
+                    if not handledTargets[target] and target.Parent then
+                        local walkTarget = getWalkTarget(target)
+                        if walkTarget then
+                            local ok, reason = walker:WalkTo(walkTarget)
+                            if ok then
+                                -- Mark it handled locally so static objects do
+                                -- not make the bot repeat the same interaction.
+                                interact(target)
+                                handledTargets[target] = true
+                                task.wait(0.15)
+                            else
+                                warn("PathWalker failed:", target:GetFullName(), reason)
+                            end
                         else
-                            warn("PathWalker failed:", target:GetFullName(), reason)
+                            handledTargets[target] = true
                         end
                     end
                 end
-                local still = findTaggedOrNamed(step.n)
-                if #still == 0 then currentStep = currentStep + 1 end
-            else
-                currentStep = currentStep + 1
             end
         end
     end
+    clearHighlights()
 end
 
 -- ============================================================
@@ -597,7 +728,7 @@ local function buildUI()
     title.BackgroundColor3 = Color3.fromRGB(6, 8, 14)
     title.BackgroundTransparency = 0.3
     title.BorderSizePixel = 0
-    title.Text = "KESTREL-7  //  " .. CHAPTER_NAME
+    title.Text = "KESTREL-7  //  " .. CHAPTER_NAME .. "  //  AUTO"
     title.TextColor3 = CYAN
     title.Font = Enum.Font.Code
     title.TextSize = 14
