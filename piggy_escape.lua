@@ -6,6 +6,7 @@ local rs    = game:GetService("RunService")
 local UIS   = game:GetService("UserInputService")
 local Tween = game:GetService("TweenService")
 local PathfindingService = game:GetService("PathfindingService")
+local CollectionService = game:GetService("CollectionService")
 
 local char  = plr.Character or plr.CharacterAdded:Wait()
 local hrp   = char:WaitForChild("HumanoidRootPart")
@@ -209,7 +210,7 @@ end
 local CONF = {
     Speed      = 22,
     BotRetreat = 40,
-    AutoRun    = false,
+    AutoRun    = true,
     Godmode    = true,
 }
 
@@ -356,18 +357,28 @@ local DEFAULT_CHAPTER = { steps = {
 -- MAP DETECTION
 -- ============================================================
 local function detectChapter()
+    -- Prefer an explicit map attribute or tag when available.
+    local mapName = workspace:GetAttribute("PiggyChapter")
+    if typeof(mapName) == "string" and CHAPTERS[mapName] then
+        return mapName, CHAPTERS[mapName]
+    end
+
     for chapterName in pairs(CHAPTERS) do
-        for _, v in ipairs(workspace:GetDescendants()) do
-            if v.Name:lower():find(chapterName:lower(), 1, true) then
+        if CollectionService:HasTag(workspace, "Chapter_" .. chapterName) then
+            return chapterName, CHAPTERS[chapterName]
+        end
+    end
+
+    -- Fallback for maps whose model name contains the chapter name.
+    for _, v in ipairs(workspace:GetDescendants()) do
+        local lowerName = v.Name:lower()
+        for chapterName in pairs(CHAPTERS) do
+            if lowerName:find(chapterName:lower(), 1, true) then
                 return chapterName, CHAPTERS[chapterName]
             end
         end
     end
-    for _, v in ipairs(workspace:GetDescendants()) do
-        if v.Name:lower():find("wrench", 1, true) then
-            return "Unknown (has Wrench)", DEFAULT_CHAPTER
-        end
-    end
+
     return "Unknown", DEFAULT_CHAPTER
 end
 
@@ -442,13 +453,47 @@ end
 -- ============================================================
 -- DISCOVERY
 -- ============================================================
-local function findByName(patterns)
-    local out = {}
-    for _, v in ipairs(workspace:GetDescendants()) do
-        if v:IsA("BasePart") or v:IsA("Model") then
-            for _, p in ipairs(patterns) do
-                if v.Name:lower():find(p:lower(), 1, true) then
-                    table.insert(out, v); break
+local function getWalkTarget(instance)
+    if not instance or not instance.Parent then
+        return nil
+    end
+    if instance:IsA("BasePart") then
+        return instance
+    end
+    if instance:IsA("Model") then
+        return instance.PrimaryPart
+            or instance:FindFirstChild("HumanoidRootPart")
+            or instance:FindFirstChildWhichIsA("BasePart", true)
+    end
+    return nil
+end
+
+local function findTaggedOrNamed(patterns)
+    local out, seen = {}, {}
+
+    -- Tags are preferred. A chapter target can have tags such as Use_ExitDoor.
+    for _, pattern in ipairs(patterns) do
+        local tag = pattern
+        if CollectionService:GetTagged(tag)[1] then
+            for _, instance in ipairs(CollectionService:GetTagged(tag)) do
+                if instance:IsDescendantOf(workspace) and not seen[instance] then
+                    seen[instance] = true
+                    table.insert(out, instance)
+                end
+            end
+        end
+    end
+
+    -- Keep the old name fallback for existing maps.
+    if #out == 0 then
+        for _, v in ipairs(workspace:GetDescendants()) do
+            if v:IsA("BasePart") or v:IsA("Model") then
+                local lowerName = v.Name:lower()
+                for _, p in ipairs(patterns) do
+                    if lowerName:find(p:lower(), 1, true) then
+                        table.insert(out, v)
+                        break
+                    end
                 end
             end
         end
@@ -474,13 +519,20 @@ local function loop()
         else
             if currentStep > #CHAPTER.steps then currentStep = 1 end
             local step = CHAPTER.steps[currentStep]
-            local found = findByName(step.n)
+            local found = findTaggedOrNamed(step.n)
             if #found > 0 then
                 for _, target in ipairs(found) do
-                    local ok = walker:WalkTo(target)
-                    if ok then interact(target) end
+                    local walkTarget = getWalkTarget(target)
+                    if walkTarget then
+                        local ok, reason = walker:WalkTo(walkTarget)
+                        if ok then
+                            interact(target)
+                        else
+                            warn("PathWalker failed:", target:GetFullName(), reason)
+                        end
+                    end
                 end
-                local still = findByName(step.n)
+                local still = findTaggedOrNamed(step.n)
                 if #still == 0 then currentStep = currentStep + 1 end
             else
                 currentStep = currentStep + 1
@@ -721,6 +773,12 @@ neutraliseWatchdogs()
 if CONF.Godmode then bindGodmode() end
 hum.WalkSpeed = CONF.Speed
 buildUI()
+
+-- Start automatically when AutoRun is enabled.
+if CONF.AutoRun and not running then
+    running = true
+    task.spawn(loop)
+end
 
 plr.CharacterAdded:Connect(function(c)
     char = c
